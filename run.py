@@ -1,152 +1,141 @@
+# run.py 内
+
 import os
-import json
-import numpy as np
-from PIL import Image
-from tqdm import tqdm
+import sys
+import argparse
 import pickle
-
+import numpy as np
 import tensorflow as tf
-from tensorflow.keras.applications import VGG16
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Dense, Flatten, Dropout
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from sklearn.model_selection import train_test_split
+import gzip
 
-def load_categories(categories_json_path):
-    """カテゴリーIDと名前のマッピングを読み込む"""
-    with open(categories_json_path, 'r') as f:
-        categories = json.load(f)
-    return categories
+import util
+import models
+import make_datasets as data
 
-def load_furniture_labels(furnitures_jsonl_path):
-    """家具IDとカテゴリーIDのマッピングを作成"""
-    furniture_labels = {}
-    with open(furnitures_jsonl_path, 'r') as f:
-        for line in f:
-            data = json.loads(line)
-            furniture_id = data['furniture_id']
-            category_id = data['category_id']
-            furniture_labels[furniture_id] = category_id
-    return furniture_labels
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['TF_DETERMINISTIC_OPS'] = '1'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
-def load_image_paths_and_labels(image_dir, furniture_labels):
-    """画像パスと対応するラベルのリストを作成"""
-    image_paths = []
-    labels = []
-    for filename in os.listdir(image_dir):
-        if filename.endswith('.jpg') or filename.endswith('.png'):
-            furniture_id = os.path.splitext(filename)[0]
-            if furniture_id in furniture_labels:
-                image_paths.append(os.path.join(image_dir, filename))
-                labels.append(furniture_labels[furniture_id])
-    return image_paths, labels
+np.random.seed(42)
+tf.random.set_seed(42)
 
-def preprocess_image(image_path, target_size=(224, 224)):
-    """画像を読み込み、前処理を行う"""
-    image = load_img(image_path, target_size=target_size)
-    image = img_to_array(image)
-    # VGG16用の前処理を適用
-    image = tf.keras.applications.vgg16.preprocess_input(image)
-    return image
-
-def prepare_data(image_paths, labels):
-    """画像とラベルを読み込み、NumPy配列として返す"""
-    images = []
-    for path in tqdm(image_paths, desc='Loading images'):
-        image = preprocess_image(path)
-        images.append(image)
-    images = np.array(images)
-    labels = np.array(labels)
-    return images, labels
-
-def build_model(num_classes):
-    """VGG16をベースとしたモデルを構築"""
-    base_model = VGG16(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-    x = base_model.output
-    x = Flatten()(x)
-    
-    # 4096 -> 2048 -> 512 -> 128 の3層のMLPを追加
-    x = Dense(4096, activation='relu')(x)
-    x = Dropout(0.5)(x)
-    x = Dense(2048, activation='relu')(x)
-    x = Dropout(0.5)(x)
-    x = Dense(512, activation='relu')(x)
-    x = Dropout(0.5)(x)
-    x = Dense(128, activation='relu', name='feature_layer')(x)
-    
-    # 最終的な分類層
-    predictions = Dense(num_classes, activation='softmax')(x)
-    model = Model(inputs=base_model.input, outputs=predictions)
-    
-    # 畳み込み層を凍結
-    for layer in base_model.layers:
-        layer.trainable = False
-
-    return model
-
-def main():
-    # データのパスを設定
-    data_dir = 'uncompressed_data'
-    categories_json_path = os.path.join(data_dir, 'metadata', 'categories.json')
-    furnitures_jsonl_path = os.path.join(data_dir, 'metadata', 'furnitures.jsonl')
-    image_dir = os.path.join(data_dir, 'furnitures')
-
-    # カテゴリーと家具のラベルを読み込む
-    categories = load_categories(categories_json_path)
-    furniture_labels = load_furniture_labels(furnitures_jsonl_path)
-
-    # 画像パスとラベルを取得
-    image_paths, labels = load_image_paths_and_labels(image_dir, furniture_labels)
-
-    # ラベルを整数のインデックスに変換
-    label_set = sorted(list(set(labels)))
-    label_to_index = {label: idx for idx, label in enumerate(label_set)}
-    labels = [label_to_index[label] for label in labels]
-
-    num_classes = len(label_set)
-    print(f'Number of classes: {num_classes}')
-    print(f'Number of samples: {len(labels)}')
-
-    # データを読み込み、前処理
-    images, labels = prepare_data(image_paths, labels)
-
-    # データを訓練用とテスト用に分割
-    X_train, X_test, y_train, y_test = train_test_split(
-        images, labels, test_size=0.2, random_state=42, stratify=labels)
-
-    # モデルを構築
-    model = build_model(num_classes)
-
-    # モデルをコンパイル
-    model.compile(optimizer=Adam(learning_rate=0.0001),
-                  loss='sparse_categorical_crossentropy',
-                  metrics=['accuracy'])
-
-    # コールバックの設定
-    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-    checkpoint = ModelCheckpoint('best_model.h5', monitor='val_loss', save_best_only=True)
-
-    # モデルの訓練
-    history = model.fit(X_train, y_train,
-                        epochs=100,
-                        batch_size=32,
-                        validation_data=(X_test, y_test),
-                        callbacks=[early_stopping, checkpoint])
-
-    # モデルの評価
-    test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
-    print(f'Test accuracy: {test_acc:.4f}')
-
-    # 特徴量の抽出（訓練データとテストデータを合わせて）
-    feature_model = Model(inputs=model.input, outputs=model.get_layer('feature_layer').output)
-    features = feature_model.predict(images)
-
-    # 特徴量とラベルをpickleで保存
-    with open('features.pkl', 'wb') as f:
-        pickle.dump({'features': features, 'labels': labels}, f, protocol=pickle.HIGHEST_PROTOCOL)
-    print('Features and labels have been saved as features.pkl')
+def load_category_centers(center_path='uncompressed_data/category_centers.pkl.gz'):
+    if not os.path.exists(center_path):
+        print("category_centers.pkl.gz not found. seed_vectors=0")
+        return None, 0
+    with gzip.open(center_path, 'rb') as f:
+        category_centers = pickle.load(f)
+    rep_vec_num = category_centers.shape[0]
+    return category_centers, rep_vec_num
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description='Run SMN model for set retrieval.')
+    # 追加引数をparserに追加
+    parser.add_argument('--output_dir', type=str, default='output', help='Directory to save outputs')
+    parser.add_argument('--train_category', action='store_true', help='Flag to train category model (現状は使用しません)')
+    parser.add_argument('--train_set_matching', action='store_true', help='Flag to train set matching model')
+    parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+    parser.add_argument('--patience', type=int, default=10, help='Patience for early stopping')
+    parser.add_argument('--max_item_num', type=int, default=5, help='Max item num per set')
+    parser.add_argument('--data_dir', type=str, default='uncompressed_data', help='Directory containing splitted data')
+    parser.add_argument('--baseMlp', type=int, default=512, help='Base MLP channel size')  # 追加
+    parser.add_argument('--is_set_norm', type=int, default=0, help='Enable set normalization (0 or 1)')
+    parser.add_argument('--is_cross_norm', type=int, default=0, help='Enable cross normalization (0 or 1)')
+    parser.add_argument('--pretrained_mlp', type=int, default=0, help='Enable pretrained MLP (0 or 1)')
+    parser.add_argument('--num_layers', type=int, default=1, help='Number of set attention layers')
+    parser.add_argument('--num_heads', type=int, default=2, help='Number of attention heads')
+    parser.add_argument('--mode', type=str, default='setRepVec_pivot', help='Mode of operation')
+    parser.add_argument('--calc_set_sim', type=str, default='CS', help='Set similarity calculation method')
+    parser.add_argument('--baseChn', type=int, default=32, help='Base channel size')
+    parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
+    parser.add_argument('--use_Cvec', type=int, default=1, help='Use category vectors (0 or 1)')
+    parser.add_argument('--is_Cvec_linear', type=int, default=0, help='Use linear transformation for category vectors (0 or 1)')
+    args = parser.parse_args()
+
+    # 出力ディレクトリ作成
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+        os.makedirs(os.path.join(args.output_dir, 'model'))
+        os.makedirs(os.path.join(args.output_dir, 'result'))
+
+    main_checkpoint_path = os.path.join(args.output_dir, "model/cp.weights.h5")
+    main_result_path = os.path.join(args.output_dir, "result/result.pkl")
+
+    # カテゴリ中心ベクトルをロードしてseed_vectorsとして利用
+    seed_vectors, rep_vec_num = load_category_centers('uncompressed_data/category_centers.pkl.gz')
+    args.rep_vec_num = rep_vec_num
+
+    # データジェネレータ用意
+    train_generator = data.trainDataGenerator(data_dir=args.data_dir, batch_size=args.batch_size, max_item_num=args.max_item_num, mode='train')
+    x_valid, x_size_valid, y_valid = train_generator.data_generation_val()
+
+    if args.train_category:
+        print("Note: train_category flag is ON (not explicitly training category model here)")
+    if args.train_set_matching:
+        print("Note: train_set_matching flag is ON, we will train SMN model for set retrieval.")
+
+    # SMNモデル構築時にseed_initとしてcategory_centersを渡す
+    model = models.SMN(
+        isCNN=False,
+        is_set_norm=(args.is_set_norm == 1),
+        is_cross_norm=(args.is_cross_norm == 1),
+        is_TrainableMLP=(args.pretrained_mlp == 1),
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
+        mode=args.mode,
+        calc_set_sim=args.calc_set_sim,
+        baseChn=args.baseChn,
+        baseMlp=args.baseMlp,
+        rep_vec_num=args.rep_vec_num,
+        seed_init=seed_vectors,  # カテゴリ中心ベクトルを初期シードとして利用
+        use_Cvec=(args.use_Cvec == 1),
+        is_Cvec_linear=(args.is_Cvec_linear == 1),
+        max_item_num=args.max_item_num  # SMNにmax_item_numを渡す
+    )
+
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=args.lr),
+                  loss=util.Set_hinge_loss,
+                  metrics=[util.Set_accuracy],
+                  run_eagerly=True)
+
+    if args.train_set_matching:
+        # コールバック
+        cp_callback = tf.keras.callbacks.ModelCheckpoint(main_checkpoint_path, monitor='val_Set_accuracy', save_weights_only=True, mode='max', save_best_only=True, verbose=1)
+        cp_earlystopping = tf.keras.callbacks.EarlyStopping(monitor='val_Set_accuracy', patience=args.patience, mode='max', min_delta=0.001, verbose=1)
+
+        history = model.fit(
+            train_generator,
+            epochs=args.epochs,
+            validation_data=((x_valid, x_size_valid), y_valid),
+            shuffle=True,
+            callbacks=[cp_callback, cp_earlystopping]
+        )
+
+        # validation
+        loss, accuracy = model.evaluate((x_valid, x_size_valid), y_valid)
+        print(f"Validation loss: {loss}, Validation accuracy: {accuracy}")
+
+        acc = history.history['Set_accuracy']
+        val_acc = history.history['val_Set_accuracy']
+        loss_hist = history.history['loss']
+        val_loss_hist = history.history['val_loss']
+
+        util.plotLossACC(args.output_dir, loss_hist, val_loss_hist, acc, val_acc)
+
+        with open(main_result_path, 'wb') as fp:
+            pickle.dump(acc, fp)
+            pickle.dump(val_acc, fp)
+            pickle.dump(loss_hist, fp)
+            pickle.dump(val_loss_hist, fp)
+    else:
+        # モデルパラメータ読み込み
+        if os.path.exists(main_checkpoint_path):
+            model.load_weights(main_checkpoint_path)
+            print("Loaded model weights.")
+        else:
+            print("No trained model found. Exiting.")
+
+    # モデルパラメータの最終保存
+    model.save_weights(main_checkpoint_path)
+    print("Done.")
