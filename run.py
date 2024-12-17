@@ -1,141 +1,409 @@
-# run.py 内
-
 import os
 import sys
-import argparse
 import pickle
 import numpy as np
 import tensorflow as tf
+from util import parser_run, plotLossACC, Set_hinge_loss, SetAccuracy
+from tensorflow.keras.callbacks import ReduceLROnPlateau
+from models import SMN
 import gzip
+import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
+import pdb
 
-import util
-import models
-import make_datasets as data
+# Eager Execution を無効化（パフォーマンス向上のため）
+tf.config.run_functions_eagerly(False)
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+# CUDA 関連の環境変数設定（必要に応じて）
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # GPU を選択
 os.environ['TF_DETERMINISTIC_OPS'] = '1'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 np.random.seed(42)
 tf.random.set_seed(42)
 
-def load_category_centers(center_path='uncompressed_data/category_centers.pkl.gz'):
+def load_category_centers(center_path='category_centers.pkl.gz'):
     if not os.path.exists(center_path):
         print("category_centers.pkl.gz not found. seed_vectors=0")
-        return None, 0
-    with gzip.open(center_path, 'rb') as f:
+        return None,0
+    with gzip.open(center_path,'rb') as f:
         category_centers = pickle.load(f)
     rep_vec_num = category_centers.shape[0]
     return category_centers, rep_vec_num
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Run SMN model for set retrieval.')
-    # 追加引数をparserに追加
-    parser.add_argument('--output_dir', type=str, default='output', help='Directory to save outputs')
-    parser.add_argument('--train_category', action='store_true', help='Flag to train category model (現状は使用しません)')
-    parser.add_argument('--train_set_matching', action='store_true', help='Flag to train set matching model')
-    parser.add_argument('--epochs', type=int, default=50, help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
-    parser.add_argument('--patience', type=int, default=10, help='Patience for early stopping')
-    parser.add_argument('--max_item_num', type=int, default=5, help='Max item num per set')
-    parser.add_argument('--data_dir', type=str, default='uncompressed_data', help='Directory containing splitted data')
-    parser.add_argument('--baseMlp', type=int, default=512, help='Base MLP channel size')  # 追加
-    parser.add_argument('--is_set_norm', type=int, default=0, help='Enable set normalization (0 or 1)')
-    parser.add_argument('--is_cross_norm', type=int, default=0, help='Enable cross normalization (0 or 1)')
-    parser.add_argument('--pretrained_mlp', type=int, default=0, help='Enable pretrained MLP (0 or 1)')
-    parser.add_argument('--num_layers', type=int, default=1, help='Number of set attention layers')
-    parser.add_argument('--num_heads', type=int, default=2, help='Number of attention heads')
-    parser.add_argument('--mode', type=str, default='setRepVec_pivot', help='Mode of operation')
-    parser.add_argument('--calc_set_sim', type=str, default='CS', help='Set similarity calculation method')
-    parser.add_argument('--baseChn', type=int, default=32, help='Base channel size')
-    parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
-    parser.add_argument('--use_Cvec', type=int, default=1, help='Use category vectors (0 or 1)')
-    parser.add_argument('--is_Cvec_linear', type=int, default=0, help='Use linear transformation for category vectors (0 or 1)')
+def save_best_metrics(history, batch_size, output_dir):
+    """最も良いvalidation accuracyの情報をCSVに保存"""
+    # トレーニング履歴からデータを取得
+    loss = history.history.get('loss', [])
+    val_loss = history.history.get('val_loss', [])
+    acc = history.history.get('Set_accuracy', [])
+    val_acc = history.history.get('val_Set_accuracy', [])
+
+    best_idx = val_acc.index(max(val_acc))
+    best_metrics = {'batch_size': batch_size, 'epoch': best_idx + 1, 'loss': loss[best_idx], 'val_loss': val_loss[best_idx], 'Set_accuracy': acc[best_idx], 'val_Set_accuracy': val_acc[best_idx]}
+    # DataFrameに変換
+    df = pd.DataFrame([best_metrics])
+
+    # CSVに保存
+    csv_path = os.path.join(output_dir, 'best_metrics.csv')
+    df.to_csv(csv_path, mode='a', header=False, index=False)
+    print(f"Best metrics saved to {csv_path}")
+
+# Data Generator
+class DataGenerator(tf.keras.utils.Sequence):
+    def __init__(self, data_path, batch_size=32, shuffle=True):
+        self.data_path = data_path  # data_path を属性として保存
+        with open(data_path, 'rb') as f:
+            # データのロード
+            # dataは (X_Q, X_P, Y, Y_cat_Q, Y_cat_P, x_sizes) の6つをロード
+            self.X_Q, self.X_P, self.Y, self.Y_cat_Q, self.Y_cat_P, self.x_sizes = pickle.load(f)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.indexes = np.arange(len(self.Y))
+        if self.shuffle:
+            np.random.shuffle(self.indexes)
+        # seed_vectorsをロード
+        self.seed_vectors, self.rep_vec_num = load_category_centers('category_centers.pkl.gz')  # 例
+
+    def __len__(self):
+        return int(np.ceil(len(self.Y) / self.batch_size))
+
+    def __getitem__(self, index):
+        batch_inds = self.indexes[index * self.batch_size:(index + 1) * self.batch_size]
+        X_Q_batch = self.X_Q[batch_inds].astype(np.float32)  # (B,8,128)
+        X_P_batch = self.X_P[batch_inds].astype(np.float32)  # (B,8,128)
+        Y_cat_Q_batch = self.Y_cat_Q[batch_inds]  # (B,8)
+        Y_cat_P_batch = self.Y_cat_P[batch_inds]  # (B,8)
+        SetID = self.Y[batch_inds]  # (B,)
+
+        # バッチ方向でconcat: (2B,8,128)
+        X_batch = np.concatenate([X_Q_batch, X_P_batch], axis=0)  # (2B,8,128)
+        SetID = np.concatenate([SetID, SetID], axis=0)  # (2B,)
+
+        # x_sizeは一律で8とする（全て同じ長さと仮定）
+        x_size = np.full(X_batch.shape[0], 8, dtype=np.float32)  # (2B,)
+
+        # y_pred_init_Q の生成
+        y_pred_init_Q = np.zeros((X_Q_batch.shape[0], X_Q_batch.shape[1], self.seed_vectors.shape[1]), dtype=np.float32)  # (B,8,128)
+        mask_Q = Y_cat_Q_batch > 0  # (B,8)
+
+        # カテゴリIDの範囲チェック
+        if np.any(Y_cat_Q_batch > self.seed_vectors.shape[0]):
+            raise ValueError(f"Y_cat_Q_batch contains invalid category IDs: {Y_cat_Q_batch[Y_cat_Q_batch > self.seed_vectors.shape[0]]}")
+        if np.any(Y_cat_Q_batch < 0):
+            raise ValueError(f"Y_cat_Q_batch contains negative category IDs: {Y_cat_Q_batch[Y_cat_Q_batch < 0]}")
+
+        # 正しくインデックスを割り当て
+        y_pred_init_Q[mask_Q] = self.seed_vectors[Y_cat_Q_batch[mask_Q] - 1]
+
+        # y_pred_init_P の生成
+        y_pred_init_P = np.zeros((X_P_batch.shape[0], X_P_batch.shape[1], self.seed_vectors.shape[1]), dtype=np.float32)  # (B,8,128)
+        mask_P = Y_cat_P_batch > 0  # (B,8)
+
+        # カテゴリIDの範囲チェック
+        if np.any(Y_cat_P_batch > self.seed_vectors.shape[0]):
+            raise ValueError(f"Y_cat_P_batch contains invalid category IDs: {Y_cat_P_batch[Y_cat_P_batch > self.seed_vectors.shape[0]]}")
+        if np.any(Y_cat_P_batch < 0):
+            raise ValueError(f"Y_cat_P_batch contains negative category IDs: {Y_cat_P_batch[Y_cat_P_batch < 0]}")
+
+        y_pred_init_P[mask_P] = self.seed_vectors[Y_cat_P_batch[mask_P] - 1]
+
+        # y_pred_init の結合: (2B,8,128)
+        y_pred_init = np.concatenate([y_pred_init_P, y_pred_init_Q], axis=0)  # (2B,8,128)
+
+        # モデルへの入力は ((X_batch, y_pred_init, x_size), SetID)
+        return ((X_batch, y_pred_init, x_size), SetID)
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.indexes)
+
+def test_item_search(model, test_gen, output_dir, top_k=10):
+    """
+    テストデータでのアイテム検索を実行し、ランキング測度を計算する。
+
+    Args:
+        model: 学習済みモデル
+        test_gen: テスト用データジェネレータ
+        output_dir: 結果を保存するディレクトリ
+        top_k: Top-k Accuracy を計算する際の k 値
+    """
+    # テストデータを全てロード
+    print("Loading test data for item search...")
+    all_queries = []
+    all_positive_indices = []
+    all_item_vectors = []
+    all_set_ids = []
+    
+    # データジェネレータがDataGeneratorクラスのインスタンスなので、data_path属性にアクセス可能
+    for batch in test_gen:
+        (X_batch, y_pred_init, x_size), SetID = batch
+        # X_batch: (2B,8,128)
+        # y_pred_init: (2B,8,128)
+        # SetID: (2B,)
+        # 前半 B がクエリ、後半 B がポジティブアイテムと仮定
+        B = X_batch.shape[0] // 2
+        queries = X_batch[:B]  # (B,8,128)
+        queries_pred_init = y_pred_init[:B]  # (B,8,128)
+        positive_items = X_batch[B:]  # (B,8,128)
+        positive_pred_init = y_pred_init[B:]  # (B,8,128)
+        set_ids = SetID[:B]  # (B,)
+        positive_set_ids = SetID[B:]  # (B,)
+        
+        all_queries.append((queries, queries_pred_init))
+        all_positive_indices.extend(positive_set_ids.tolist())
+        all_item_vectors.append((positive_items, positive_pred_init))
+        all_set_ids.extend(set_ids.tolist())
+
+        pdb.set_trace()
+
+    # Concatenate all queries and items
+    all_queries = np.concatenate([q[0] for q in all_queries], axis=0)  # (Total_B,8,128)
+    all_queries_pred_init = np.concatenate([q[1] for q in all_queries], axis=0)  # (Total_B,8,128)
+    all_item_vectors = np.concatenate([i[0] for i in all_item_vectors], axis=0)  # (Total_B,8,128)
+    all_item_pred_init = np.concatenate([i[1] for i in all_item_vectors], axis=0)  # (Total_B,8,128)
+
+    total_queries = all_queries.shape[0]
+    total_items = all_item_vectors.shape[0]
+
+    pdb.set_trace()
+
+    print(f"Total queries: {total_queries}, Total items: {total_items}")
+
+    # Create a new model that outputs set embeddings
+    print("Modifying SMN to output set embeddings for test item search...")
+
+    class SMN_Embedding(tf.keras.Model):
+        def __init__(self, original_model, **kwargs):
+            super(SMN_Embedding, self).__init__(**kwargs)
+            self.original_model = original_model
+
+        def call(self, inputs, training=False):
+            X, y_pred_init, x_size = inputs
+            if self.original_model.isCNN and self.original_model.fc_cnn_proj is not None:
+                X = self.original_model.fc_cnn_proj(X)
+
+            # Encoder
+            for i in range(self.original_model.num_layers):
+                z = self.original_model.layer_norms_enc1X[i](X)
+                z = self.original_model.self_attentionsX[i](z, z)
+                X = X + z
+
+                z = self.original_model.layer_norms_enc2X[i](X)
+                z = self.original_model.fcs_encX[i](z)
+                X = X + z
+
+            # Decoder
+            y_pred = y_pred_init
+            for i in range(self.original_model.num_layers):
+                q = self.original_model.layer_norms_decq[i](y_pred)
+                k = self.original_model.layer_norms_deck[i](X)
+
+                q = self.original_model.cross_attentions[i](q, k)
+                y_pred = y_pred + q
+
+                q = self.original_model.layer_norms_dec2[i](y_pred)
+                q = self.original_model.fcs_dec[i](q)
+                y_pred = y_pred + q
+
+            # Instead of cross_set_score, return y_pred as the embedding
+            return y_pred  # (batch_size,8,128)
+
+    # Instantiate the embedding model
+    embedding_model = SMN_Embedding(model)
+    embedding_model.compile(optimizer='adam')  # Dummy compile
+
+    # Encode all items to obtain their embeddings
+    print("Encoding all items to obtain embeddings...")
+    item_embeddings = []
+    # Define a new DataGenerator for items only
+    class ItemGenerator(tf.keras.utils.Sequence):
+        def __init__(self, item_vectors, item_pred_init, batch_size=128):
+            self.item_vectors = item_vectors
+            self.item_pred_init = item_pred_init
+            self.batch_size = batch_size
+            self.indexes = np.arange(len(self.item_vectors))
+
+        def __len__(self):
+            return int(np.ceil(len(self.item_vectors) / self.batch_size))
+
+        def __getitem__(self, index):
+            batch_inds = self.indexes[index * self.batch_size:(index + 1) * self.batch_size]
+            X_batch = self.item_vectors[batch_inds].astype(np.float32)
+            y_pred_init = self.item_pred_init[batch_inds].astype(np.float32)
+            x_size = np.full(X_batch.shape[0], 8, dtype=np.float32)
+            return ((X_batch, y_pred_init, x_size), None)
+
+        def on_epoch_end(self):
+            pass
+
+    item_gen = ItemGenerator(all_item_vectors, all_item_pred_init, batch_size=128)
+    for batch in item_gen:
+        (X_batch, y_pred_init, x_size), _ = batch
+        embeddings = embedding_model((X_batch, y_pred_init, x_size), training=False)  # (B,8,128)
+        embeddings = tf.reduce_mean(embeddings, axis=1)  # (B,128)
+        item_embeddings.append(embeddings.numpy())
+    item_embeddings = np.concatenate(item_embeddings, axis=0)  # (Total_Items,128)
+
+    # Encode all queries to obtain their embeddings
+    print("Encoding all queries to obtain embeddings...")
+    query_embeddings = []
+    class QueryGenerator(tf.keras.utils.Sequence):
+        def __init__(self, query_vectors, query_pred_init, batch_size=128):
+            self.query_vectors = query_vectors
+            self.query_pred_init = query_pred_init
+            self.batch_size = batch_size
+            self.indexes = np.arange(len(self.query_vectors))
+
+        def __len__(self):
+            return int(np.ceil(len(self.query_vectors) / self.batch_size))
+
+        def __getitem__(self, index):
+            batch_inds = self.indexes[index * self.batch_size:(index + 1) * self.batch_size]
+            X_batch = self.query_vectors[batch_inds].astype(np.float32)
+            y_pred_init = self.query_pred_init[batch_inds].astype(np.float32)
+            x_size = np.full(X_batch.shape[0], 8, dtype=np.float32)
+            return ((X_batch, y_pred_init, x_size), None)
+
+        def on_epoch_end(self):
+            pass
+
+    query_gen = QueryGenerator(all_queries, all_queries_pred_init, batch_size=128)
+    for batch in query_gen:
+        (X_batch, y_pred_init, x_size), _ = batch
+        embeddings = embedding_model((X_batch, y_pred_init, x_size), training=False)  # (B,8,128)
+        embeddings = tf.reduce_mean(embeddings, axis=1)  # (B,128)
+        query_embeddings.append(embeddings.numpy())
+    query_embeddings = np.concatenate(query_embeddings, axis=0)  # (Total_Queries,128)
+
+    # Compute cosine similarity between queries and items
+    print("Computing cosine similarity between queries and items...")
+    similarity_matrix = cosine_similarity(query_embeddings, item_embeddings)  # (Total_Queries, Total_Items)
+
+    # For each query, find the rank of the positive item
+    print("Calculating ranks of positive items...")
+    ranks = []
+    for i in range(total_queries):
+        # Positive set ID
+        positive_set_id = all_positive_indices[i]
+        # Find the indices of items with the same set ID
+        positive_indices = [idx for idx, set_id in enumerate(all_set_ids) if set_id == positive_set_id]
+        if not positive_indices:
+            print(f"No positive items found for SetID {positive_set_id} in query {i}. Skipping.")
+            continue
+        # Assuming the first occurrence is the correct positive item
+        positive_index = positive_indices[0]
+        
+        # Similarity scores for this query
+        sim_scores = similarity_matrix[i]
+        # Rank the similarity scores in descending order
+        ranked_indices = np.argsort(-sim_scores)
+        
+        # Find the rank of the positive item
+        rank = np.where(ranked_indices == positive_index)[0][0] + 1  # Ranks start at 1
+        ranks.append(rank)
+
+    # Calculate evaluation metrics
+    mrr = np.mean(1 / np.array(ranks))
+    top_k_acc = np.mean(np.array(ranks) <= top_k)
+
+    print(f"Test Results -> MRR: {mrr:.4f}, Top-{top_k} Accuracy: {top_k_acc:.4f}")
+
+    # Save results to CSV
+    result_df = pd.DataFrame({"Rank": ranks})
+    csv_path = os.path.join(output_dir, "test_item_search_results.csv")
+    result_df.to_csv(csv_path, index=False)
+    print(f"Test item search results saved to {csv_path}")
+
+
+
+def main():
+    # コマンドライン引数のパース
+    parser = parser_run()
     args = parser.parse_args()
 
-    # 出力ディレクトリ作成
+    # 出力ディレクトリの作成
     if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir)
-        os.makedirs(os.path.join(args.output_dir, 'model'))
-        os.makedirs(os.path.join(args.output_dir, 'result'))
+        os.makedirs(args.output_dir, exist_ok=True)
 
-    main_checkpoint_path = os.path.join(args.output_dir, "model/cp.weights.h5")
-    main_result_path = os.path.join(args.output_dir, "result/result.pkl")
+    # データのパス
+    train_path = os.path.join('uncompressed_data', 'datasets', 'train.pkl')
+    val_path = os.path.join('uncompressed_data', 'datasets', 'validation.pkl')
+    test_path = os.path.join('uncompressed_data', 'datasets', 'test.pkl')
 
-    # カテゴリ中心ベクトルをロードしてseed_vectorsとして利用
-    seed_vectors, rep_vec_num = load_category_centers('uncompressed_data/category_centers.pkl.gz')
-    args.rep_vec_num = rep_vec_num
+    # データジェネレータの作成
+    train_gen = DataGenerator(train_path, batch_size=args.batch_size, shuffle=True)
+    val_gen = DataGenerator(val_path, batch_size=args.batch_size, shuffle=False)
+    test_gen = DataGenerator(test_path, batch_size=args.batch_size, shuffle=False)
 
-    # データジェネレータ用意
-    train_generator = data.trainDataGenerator(data_dir=args.data_dir, batch_size=args.batch_size, max_item_num=args.max_item_num, mode='train')
-    x_valid, x_size_valid, y_valid = train_generator.data_generation_val()
+    # ReduceLROnPlateau コールバックの設定
+    reduce_lr = ReduceLROnPlateau(monitor='val_Set_accuracy', factor=0.5, patience=5, min_lr=1e-6, verbose=1)
 
-    if args.train_category:
-        print("Note: train_category flag is ON (not explicitly training category model here)")
-    if args.train_set_matching:
-        print("Note: train_set_matching flag is ON, we will train SMN model for set retrieval.")
-
-    # SMNモデル構築時にseed_initとしてcategory_centersを渡す
-    model = models.SMN(
-        isCNN=False,
-        is_set_norm=(args.is_set_norm == 1),
-        is_cross_norm=(args.is_cross_norm == 1),
-        is_TrainableMLP=(args.pretrained_mlp == 1),
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-        mode=args.mode,
-        calc_set_sim=args.calc_set_sim,
-        baseChn=args.baseChn,
-        baseMlp=args.baseMlp,
-        rep_vec_num=args.rep_vec_num,
-        seed_init=seed_vectors,  # カテゴリ中心ベクトルを初期シードとして利用
-        use_Cvec=(args.use_Cvec == 1),
-        is_Cvec_linear=(args.is_Cvec_linear == 1),
-        max_item_num=args.max_item_num  # SMNにmax_item_numを渡す
+    # モデルの初期化
+    model = SMN(
+        isCNN=False, 
+        num_layers=1,
+        num_heads=2,
+        rep_vec_num=1,
+        dim=128,
     )
 
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=args.lr),
-                  loss=util.Set_hinge_loss,
-                  metrics=[util.Set_accuracy],
-                  run_eagerly=True)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001, clipnorm=1.0),
+        loss=Set_hinge_loss,
+        metrics=[SetAccuracy()],  # カスタムメトリックを追加
+        run_eagerly=True  # デバッグ目的で必要な場合のみ True
+    )
 
-    if args.train_set_matching:
-        # コールバック
-        cp_callback = tf.keras.callbacks.ModelCheckpoint(main_checkpoint_path, monitor='val_Set_accuracy', save_weights_only=True, mode='max', save_best_only=True, verbose=1)
-        cp_earlystopping = tf.keras.callbacks.EarlyStopping(monitor='val_Set_accuracy', patience=args.patience, mode='max', min_delta=0.001, verbose=1)
+    # コールバックの設定
+    early_stop = tf.keras.callbacks.EarlyStopping(
+        monitor='val_Set_accuracy',  # メトリクス名を修正
+        patience=args.patience,
+        restore_best_weights=True,
+        mode='max',
+        verbose=1
+    )
+    model_checkpoint = tf.keras.callbacks.ModelCheckpoint(
+        os.path.join(args.output_dir, 'best_model.weights.h5'),
+        monitor='val_Set_accuracy',  # メトリクス名を修正
+        save_best_only=True,
+        save_weights_only=True,
+        mode='max',
+        verbose=1
+    )
 
-        history = model.fit(
-            train_generator,
-            epochs=args.epochs,
-            validation_data=((x_valid, x_size_valid), y_valid),
-            shuffle=True,
-            callbacks=[cp_callback, cp_earlystopping]
-        )
+    # メトリクス名の確認
+    print("Metrics names:", model.metrics_names)
+    print("Registered metrics:", [metric.name for metric in model.metrics])
 
-        # validation
-        loss, accuracy = model.evaluate((x_valid, x_size_valid), y_valid)
-        print(f"Validation loss: {loss}, Validation accuracy: {accuracy}")
+    # モデルのトレーニング
+    history = model.fit(
+        train_gen,
+        epochs=args.epochs,
+        validation_data=val_gen,
+        callbacks=[early_stop, model_checkpoint, reduce_lr],
+    )
 
-        acc = history.history['Set_accuracy']
-        val_acc = history.history['val_Set_accuracy']
-        loss_hist = history.history['loss']
-        val_loss_hist = history.history['val_loss']
+    model.summary()
 
-        util.plotLossACC(args.output_dir, loss_hist, val_loss_hist, acc, val_acc)
+    # トレーニング履歴のプロット
+    loss = history.history.get('loss', [])
+    val_loss = history.history.get('val_loss', [0] * len(loss))
+    acc = history.history.get('Set_accuracy', [0] * len(loss))
+    val_acc = history.history.get('val_Set_accuracy', [0] * len(loss))
 
-        with open(main_result_path, 'wb') as fp:
-            pickle.dump(acc, fp)
-            pickle.dump(val_acc, fp)
-            pickle.dump(loss_hist, fp)
-            pickle.dump(val_loss_hist, fp)
-    else:
-        # モデルパラメータ読み込み
-        if os.path.exists(main_checkpoint_path):
-            model.load_weights(main_checkpoint_path)
-            print("Loaded model weights.")
-        else:
-            print("No trained model found. Exiting.")
+    save_best_metrics(history, args.batch_size, args.output_dir)
 
-    # モデルパラメータの最終保存
-    model.save_weights(main_checkpoint_path)
-    print("Done.")
+    # プロット
+    plotLossACC(args.output_dir, args.batch_size, loss, val_loss, acc, val_acc)
+
+    # テストデータでのアイテム検索
+    test_item_search(model, test_gen, args.output_dir, top_k=10)
+
+    # 最終モデルの保存
+    model.save_weights(os.path.join(args.output_dir, 'final_model.weights.h5'))
+
+    print("Training completed successfully.")
+
+if __name__ == '__main__':
+    main()

@@ -1,180 +1,197 @@
 import tensorflow as tf
 import numpy as np
+import psutil
+import os
+import sys
+from util import SetAccuracy  # カスタムメトリクスをインポート
 import pdb
 
-class layer_normalization(tf.keras.layers.Layer):
-    def __init__(self, size_d, epsilon=1e-3, is_set_norm=False):
-        super(layer_normalization, self).__init__()
+class LayerNormalization(tf.keras.layers.Layer):
+    def __init__(self, size_d, epsilon=1e-3, **kwargs):
+        super(LayerNormalization, self).__init__(**kwargs)
         self.epsilon = epsilon
-        self.is_set_norm = is_set_norm
+        self.size_d = size_d
 
-    def call(self, x, x_size):
+    def build(self, input_shape):
+        self.gamma = self.add_weight(shape=(self.size_d,), initializer='ones', trainable=True)
+        self.beta = self.add_weight(shape=(self.size_d,), initializer='zeros', trainable=True)
+        super(LayerNormalization, self).build(input_shape)
+
+    def call(self, x):
         mean = tf.reduce_mean(x, axis=-1, keepdims=True)
         std = tf.math.reduce_std(x, axis=-1, keepdims=True)
-        norm = (x - mean)/(std + self.epsilon)
-        return norm
+        norm = (x - mean) / (std + self.epsilon)
+        output = self.gamma * norm + self.beta
+        return output
 
-class set_attention(tf.keras.layers.Layer):
-    def __init__(self, head_size=64, num_heads=2):
-        super(set_attention, self).__init__()
+class SetAttention(tf.keras.layers.Layer):
+    def __init__(self, head_size=64, num_heads=2, **kwargs):
+        super(SetAttention, self).__init__(**kwargs)
         self.head_size = head_size
         self.num_heads = num_heads
         self.linearQ = tf.keras.layers.Dense(units=self.head_size * self.num_heads, use_bias=False)
         self.linearK = tf.keras.layers.Dense(units=self.head_size * self.num_heads, use_bias=False)
         self.linearV = tf.keras.layers.Dense(units=self.head_size * self.num_heads, use_bias=False)
-        self.linearH = tf.keras.layers.Dense(units=self.head_size, use_bias=False)
+        self.linearH = tf.keras.layers.Dense(units=self.head_size * self.num_heads, use_bias=False)
+
+    def build(self, input_shape):
+        super(SetAttention, self).build(input_shape)
 
     def call(self, q, k):
+        batch_size = tf.shape(q)[0]
+
         q_ = self.linearQ(q)
         k_ = self.linearK(k)
         v_ = self.linearV(k)
-        sqrt_head_size = tf.sqrt(tf.cast(self.head_size, tf.float32))
 
-        shape_q = tf.shape(q_)
-        shape_k = tf.shape(k_)
-        nSet = shape_q[0]
-        nItemMax_q = shape_q[1]
-        nItemMax_k = shape_k[1]
+        q_ = tf.reshape(q_, [batch_size, -1, self.num_heads, self.head_size])
+        k_ = tf.reshape(k_, [batch_size, -1, self.num_heads, self.head_size])
+        v_ = tf.reshape(v_, [batch_size, -1, self.num_heads, self.head_size])
 
-        q_ = tf.reshape(q_, [nSet, nItemMax_q, self.num_heads, self.head_size])
-        k_ = tf.reshape(k_, [nSet, nItemMax_k, self.num_heads, self.head_size])
-        v_ = tf.reshape(v_, [nSet, nItemMax_k, self.num_heads, self.head_size])
+        q_ = tf.transpose(q_, [0, 2, 1, 3])
+        k_ = tf.transpose(k_, [0, 2, 1, 3])
+        v_ = tf.transpose(v_, [0, 2, 1, 3])
 
-        # Transpose for multi-head attention
-        q_ = tf.transpose(q_, [0, 2, 1, 3])  # (nSet, num_heads, nItemMax_q, head_size)
-        k_ = tf.transpose(k_, [0, 2, 1, 3])  # (nSet, num_heads, nItemMax_k, head_size)
-        v_ = tf.transpose(v_, [0, 2, 1, 3])  # (nSet, num_heads, nItemMax_k, head_size)
+        score = tf.matmul(q_, k_, transpose_b=True) / tf.sqrt(tf.cast(self.head_size, tf.float32))
+        weights = tf.nn.softmax(score, axis=-1)
+        output = tf.matmul(weights, v_)
 
-        # Compute attention scores
-        score = tf.matmul(q_, k_, transpose_b=True) / sqrt_head_size  # (nSet, num_heads, nItemMax_q, nItemMax_k)
-        score = tf.nn.softmax(score, axis=-1)  # Softmax over the last axis
-
-        # Weighted sum of values
-        weighted_v = tf.matmul(score, v_)  # (nSet, num_heads, nItemMax_q, head_size)
-
-        # Reshape back to (nSet, nItemMax_q, num_heads * head_size)
-        weighted_v = tf.transpose(weighted_v, [0, 2, 1, 3])
-        weighted_v = tf.reshape(weighted_v, [nSet, nItemMax_q, self.num_heads * self.head_size])
-
-        # Final linear layer
-        output = self.linearH(weighted_v)  # (nSet, nItemMax_q, head_size)
+        output = tf.transpose(output, [0, 2, 1, 3])
+        output = tf.reshape(output, [batch_size, -1, self.head_size * self.num_heads])
+        output = self.linearH(output)
         return output
-# models.py 内
 
-class cross_set_score(tf.keras.layers.Layer):
-    def __init__(self):
-        super(cross_set_score, self).__init__()
-        # 必要に応じて追加のレイヤーをここに定義
-
-    def call(self, x):
-        gallery, query = x  # gallery と query は共に (batch_size, 1, 64) の形状
-
-        # 形状を (batch_size, 64) に変更
-        gallery = tf.squeeze(gallery, axis=1)  # (batch_size, 64)
-        query = tf.squeeze(query, axis=1)      # (batch_size, 64)
-
-        # セット間の類似度を計算（ドット積）
-        similarity = tf.matmul(gallery, query, transpose_b=True)  # (batch_size, batch_size)
-
-        return similarity  # 出力形状は (batch_size, batch_size)
-
-# models.py 内
-
-class SMN(tf.keras.Model):
-    def __init__(self, 
-                 isCNN=False,
-                 is_set_norm=False, 
-                 is_cross_norm=False, 
-                 is_TrainableMLP=False,
-                 num_layers=1, 
-                 num_heads=2, 
-                 mode='setRepVec_pivot', 
-                 calc_set_sim='CS', 
-                 baseChn=32, 
-                 baseMlp=512, 
-                 rep_vec_num=41, 
-                 seed_init=None, 
-                 use_Cvec=True,
-                 is_Cvec_linear=False,
-                 max_item_num=5):
-        super(SMN, self).__init__()
-        self.isCNN = isCNN
-        self.is_set_norm = is_set_norm
-        self.is_TrainableMLP = is_TrainableMLP
-        self.num_layers = num_layers
+class CrossSetScore(tf.keras.layers.Layer):
+    def __init__(self, head_size=64, num_heads=2, **kwargs):
+        super(CrossSetScore, self).__init__(**kwargs)
+        self.head_size = head_size
         self.num_heads = num_heads
-        self.mode = mode
-        self.calc_set_sim = calc_set_sim
-        self.rep_vec_num = rep_vec_num
-        self.use_Cvec = use_Cvec
-        self.is_Cvec_linear = is_Cvec_linear
-        self.max_item_num = max_item_num  # メンバー変数として保持
-        self.baseMlp = baseMlp  # 追加
-
-        self.dim = 64
-        self.fc_item = tf.keras.layers.Dense(self.dim, use_bias=False)
-
-        self.set_att = [set_attention(head_size=self.dim, num_heads=self.num_heads) for _ in range(self.num_layers)]
-        self.ln_set = [layer_normalization(size_d=self.dim, is_set_norm=self.is_set_norm) for _ in range(self.num_layers)]
-        self.cross_set_score = cross_set_score()  # 修正済み
-
-        # Initialize seed vectors if provided
-        if seed_init is not None:
-            self.seed_init = tf.constant(seed_init, dtype=tf.float32)
-        else:
-            self.seed_init = 0
+        self.linear_gallery = tf.keras.layers.Dense(units=self.head_size * self.num_heads, use_bias=False)
+        self.linear_query = tf.keras.layers.Dense(units=self.head_size * self.num_heads, use_bias=False)
 
     def build(self, input_shape):
-        super(SMN, self).build(input_shape)
-        # 必要に応じて追加のビルド処理
+        super(CrossSetScore, self).build(input_shape)
 
-    def cross_set_label(self, y):
-        y_rows = tf.tile(tf.expand_dims(y, -1), [1, tf.shape(y)[0]])
-        y_cols = tf.tile(tf.expand_dims(y, 0), [tf.shape(y)[0], 1])
-        labels = tf.cast(y_rows == y_cols, tf.float32)
-        return labels
+    def call(self, inputs):
+        gallery, query = inputs
+        gallery = self.linear_gallery(gallery)
+        query = self.linear_query(query)
+
+        gallery = tf.reduce_mean(gallery, axis=1)
+        query = tf.reduce_mean(query, axis=1)
+
+        sim_matrix = tf.matmul(gallery, query, transpose_b=True)
+        return sim_matrix
+
+class SMN(tf.keras.Model):
+    def __init__(self, isCNN=True, seed_init=None, num_layers=1, num_heads=2, rep_vec_num=1, dim=128, **kwargs):
+        super(SMN, self).__init__(**kwargs)
+        self.isCNN = isCNN
+        self.num_layers = num_layers
+        self.rep_vec_num = rep_vec_num
+        self.dim = dim
+        self.seed_init = seed_init
+
+        if self.isCNN:
+            self.fc_cnn_proj = tf.keras.layers.Dense(self.dim, use_bias=False)
+        else:
+            self.fc_cnn_proj = None
+
+        # self.set_emb = self.add_weight(name='set_emb', shape=(1, self.rep_vec_num, self.dim), initializer='zeros', trainable=True)
+
+        self.self_attentionsX = [SetAttention(head_size=64, num_heads=num_heads) for _ in range(num_layers)]
+        self.layer_norms_enc1X = [LayerNormalization(size_d=self.dim) for _ in range(num_layers)]
+        self.layer_norms_enc2X = [LayerNormalization(size_d=self.dim) for _ in range(num_layers)]
+        self.fcs_encX = [tf.keras.layers.Dense(self.dim, use_bias=False) for _ in range(num_layers)]
+
+        self.cross_attentions = [SetAttention(head_size=64, num_heads=num_heads) for _ in range(num_layers)]
+        self.layer_norms_dec1 = [LayerNormalization(size_d=self.dim) for _ in range(num_layers)]
+        self.layer_norms_dec2 = [LayerNormalization(size_d=self.dim) for _ in range(num_layers)]
+        self.layer_norms_decq = [LayerNormalization(size_d=self.dim) for _ in range(num_layers)]
+        self.layer_norms_deck = [LayerNormalization(size_d=self.dim) for _ in range(num_layers)]
+        self.fcs_dec = [tf.keras.layers.Dense(self.dim, use_bias=False) for _ in range(num_layers)]
+
+        self.cross_set_score = CrossSetScore(head_size=64, num_heads=num_heads)
 
     def call(self, inputs, training=False):
-        x, x_size = inputs
-        # x: (batch_size, max_item_num, feature_dim=256)
-        x_proj = self.fc_item(x)  # (batch_size, max_item_num, dim=64)
+        X, y_pred_init, x_size = inputs  # 修正後のデータ形式に合わせてアンパック
+        if self.isCNN and self.fc_cnn_proj is not None:
+            X = self.fc_cnn_proj(X)
 
-        z = x_proj
+        # Encoder
         for i in range(self.num_layers):
-            z_norm = self.ln_set[i](z, x_size)
-            z_att = self.set_att[i](z_norm, z_norm)
-            z = z + z_att
+            z = self.layer_norms_enc1X[i](X)
+            z = self.self_attentionsX[i](z, z)
+            X = X + z
 
-        # set representation
-        set_repr = tf.reduce_mean(z, axis=1)  # (batch_size, dim=64)
-        set_repr = tf.expand_dims(set_repr, axis=1)  # (batch_size, 1, dim=64)
-        return set_repr
+            z = self.layer_norms_enc2X[i](X)
+            z = self.fcs_encX[i](z)
+            X = X + z
+
+        # Decoder
+        # y_pred = tf.tile(self.set_emb, [tf.shape(X)[0], 1, 1]) # クラスタ中心なしバージョン
+        y_pred = y_pred_init
+        for i in range(self.num_layers):
+            q = self.layer_norms_decq[i](y_pred)
+            k = self.layer_norms_deck[i](X)
+
+            q = self.cross_attentions[i](q, k)
+            y_pred = y_pred + q
+
+            q = self.layer_norms_dec2[i](y_pred)
+            q = self.fcs_dec[i](q)
+            y_pred = y_pred + q
+
+        set_score = self.cross_set_score((X, y_pred))
+        return set_score
+
+    def cross_set_label(self, y):
+        y = tf.reshape(y, [-1]) 
+        y_rows = tf.tile(tf.expand_dims(y, -1), [1, tf.shape(y)[0]])
+        y_cols = tf.tile(tf.expand_dims(y, 0), [tf.shape(y)[0], 1])
+        labels = tf.cast(tf.equal(y_rows, y_cols), tf.float32)
+        return labels
+
+    def log_memory_usage(self, message):
+        process = psutil.Process(os.getpid())
+        # 必要に応じてメモリ使用量をログに記録
 
     def train_step(self, data):
-        (x, x_size), y = data
+        (X_batch, y_pred_init_batch, x_size), SetID = data  # 修正後のデータ形式に合わせてアンパック
+
         with tf.GradientTape() as tape:
-            set_repr = self((x, x_size), training=True)  # (batch_size,1,64)
-            y_true = self.cross_set_label(y)  # (batch_size, batch_size)
-            y_true = tf.linalg.set_diag(y_true, tf.zeros([tf.shape(y_true)[0]], dtype=tf.float32))  # 自己との類似度を0に設定
+            set_score = self((X_batch, y_pred_init_batch, x_size), training=True)
+            y_true = self.cross_set_label(SetID)
+            y_true = tf.linalg.set_diag(y_true, tf.zeros([tf.shape(y_true)[0]], dtype=tf.float32))
+            loss = self.compiled_loss(y_true, set_score, regularization_losses=self.losses)
 
-            set_score = self.cross_set_score((set_repr, set_repr))  # (batch_size, batch_size)
-
-            loss = self.compiled_loss(set_score, y_true, regularization_losses=self.losses)
-
+        # 勾配計算と適用
         grads = tape.gradient(loss, self.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
 
-        self.compiled_metrics.update_state(set_score, y_true)
-        return {m.name: m.result() for m in self.metrics}
+        # メトリックの更新
+        self.compiled_metrics.update_state(y_true, set_score)
+
+        # 結果の収集
+        results = {"loss": loss}
+        for metric in self.metrics:
+            metric_value = metric.result()
+            results[metric.name] = metric_value
+
+        return results
 
     def test_step(self, data):
-        (x, x_size), y = data
-        set_repr = self((x, x_size), training=False)  # (batch_size,1,64)
-        y_true = self.cross_set_label(y)  # (batch_size, batch_size)
-        y_true = tf.linalg.set_diag(y_true, tf.zeros([tf.shape(y_true)[0]], dtype=tf.float32))  # 自己との類似度を0に設定
+        (X_batch, y_pred_init_batch, x_size), SetID = data
+        set_score = self((X_batch, y_pred_init_batch, x_size), training=False)
+        y_true = self.cross_set_label(SetID)
+        y_true = tf.linalg.set_diag(y_true, tf.zeros([tf.shape(y_true)[0]], dtype=tf.float32))
+        loss = self.compiled_loss(y_true, set_score, regularization_losses=self.losses)
+        self.compiled_metrics.update_state(y_true, set_score)
 
-        set_score = self.cross_set_score((set_repr, set_repr))  # (batch_size, batch_size)
-        self.compiled_loss(set_score, y_true, regularization_losses=self.losses)
-        self.compiled_metrics.update_state(set_score, y_true)
+        # 結果の収集
+        results = {"loss": loss}
+        for metric in self.metrics:
+            metric_value = metric.result()
+            results[metric.name] = metric_value
 
-        return {m.name: m.result() for m in self.metrics}
+        return results

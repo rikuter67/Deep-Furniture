@@ -2,182 +2,126 @@ import os
 import pickle
 import numpy as np
 import random
-import argparse
 from sklearn.model_selection import train_test_split
-import tensorflow as tf
+from tqdm import tqdm
+import argparse
+import json
 
-class DataGenerator(tf.keras.utils.Sequence):
-    """
-    カテゴリ分類用のデータジェネレーター。
-    シンプルに単一アイテム単位で返す。
-    """
-    def __init__(self, data_dir, batch_size=32, shuffle=True, mode='train_category'):
-        self.data_dir = data_dir
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.mode = mode
-        self._load_data()
-        self.indexes = np.arange(len(self.y))
-        if self.shuffle:
-            np.random.shuffle(self.indexes)
+def pad_features(features, target_num=8):
+    current_num = features.shape[0]
+    if current_num < target_num:
+        padding = np.zeros((target_num - current_num, features.shape[1]), dtype=features.dtype)
+        padded_features = np.vstack([features, padding])
+    else:
+        padded_features = features[:target_num]
+        current_num = target_num
+    return padded_features, current_num
 
-    def _load_data(self):
-        data_path = os.path.join(self.data_dir, f'{self.mode}.pkl')
-        if not os.path.exists(data_path):
-            raise FileNotFoundError(f"{data_path} not found.")
-        with open(data_path, 'rb') as f:
-            self.X, self.y = pickle.load(f)
-        self.y = np.array(self.y)
+def pad_categories(categories, target_num=8):
+    current_num = categories.shape[0]
+    if current_num < target_num:
+        padding = np.zeros(target_num - current_num, dtype=int)  # デフォルトカテゴリID=0
+        padded_categories = np.concatenate([categories, padding])
+    else:
+        padded_categories = categories[:target_num]
+        current_num = target_num
+    return padded_categories, current_num
 
-    def __len__(self):
-        return int(np.ceil(len(self.X) / self.batch_size))
+def create_query_positive_groups(scene_features, min_items=6, max_items=16, max_item_num=8):
+    X_Q = []
+    X_P = []
+    Y = []
+    Y_cat_Q = []
+    Y_cat_P = []
+    X_sizes = []
+    for scene_id, data in tqdm(scene_features.items(), desc='Processing scenes'):
+        features = data['features']      # shape: (n_items, feature_dim)
+        category_ids = data['category_ids']  # shape: (n_items,)
+        num_items = features.shape[0]
+        if num_items < min_items or num_items > max_items:
+            continue
+        queries_num = num_items // 2
+        indices = list(range(num_items))
+        random.shuffle(indices)
+        query_indices = indices[:queries_num]
+        positive_indices = indices[queries_num:]
 
-    def __getitem__(self, index):
-        batch_indexes = self.indexes[index * self.batch_size:(index + 1) * self.batch_size]
-        X_batch = self.X[batch_indexes]
-        y_batch = self.y[batch_indexes]
-        X_batch = np.array(X_batch, dtype=np.float32)
-        y_batch = np.array(y_batch, dtype=np.float32)
-        return X_batch, y_batch
+        queries = features[query_indices]
+        queries_cat = category_ids[query_indices]
+        positives = features[positive_indices]
+        positives_cat = category_ids[positive_indices]
 
-    def on_epoch_end(self):
-        if self.shuffle:
-            np.random.shuffle(self.indexes)
+        queries_padded, q_size = pad_features(queries, target_num=max_item_num)
+        queries_cat_padded, _ = pad_categories(queries_cat, target_num=max_item_num)
+        positives_padded, p_size = pad_features(positives, target_num=max_item_num)
+        positives_cat_padded, _ = pad_categories(positives_cat, target_num=max_item_num)
 
+        X_Q.append(queries_padded)
+        Y_cat_Q.append(queries_cat_padded)
+        X_P.append(positives_padded)
+        Y_cat_P.append(positives_cat_padded)
+        Y.append(scene_id)
+        X_sizes.append(q_size)  # クエリ側のアイテム数(元の数)を記録
 
-class SetMatchingDataGenerator(tf.keras.utils.Sequence):
-    """
-    SetMatchingモデル用のデータジェネレーター。
-    (X1, X2), y形式。
-    """
-    def __init__(self, data_dir, batch_size=32, shuffle=True, mode='train'):
-        self.data_dir = data_dir
-        self.batch_size = batch_size
-        self.shuffle = shuffle
-        self.mode = mode
-        self._load_data()
-        self.indexes = np.arange(len(self.y))
-        if self.shuffle:
-            np.random.shuffle(self.indexes)
+    return np.array(X_Q), np.array(X_P), np.array(Y), np.array(Y_cat_Q), np.array(Y_cat_P), np.array(X_sizes)
 
-    def _load_data(self):
-        path = os.path.join(self.data_dir, f'set_matching_{self.mode}.pkl')
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"{path} not found.")
-        with open(path, 'rb') as f:
-            X1, X2, y = pickle.load(f)
-        self.X1 = X1
-        self.X2 = X2
-        self.y = y
-        self.y = np.array(self.y)
+def main():
+    parser = argparse.ArgumentParser(description="Generate datasets for set retrieval.")
+    parser.add_argument('--raw_data_path', type=str, required=True, help='Path to raw data pickle file')
+    parser.add_argument('--output_dir', type=str, required=True, help='Directory to save processed datasets')
+    parser.add_argument('--test_size', type=float, default=0.2, help='Proportion of data to be used as test set')
+    parser.add_argument('--validation_size', type=float, default=0.1, help='Proportion of data to be used as validation set')
+    parser.add_argument('--min_items', type=int, default=6, help='Minimum number of items in a scene')
+    parser.add_argument('--max_items', type=int, default=16, help='Maximum number of items in a scene')
+    parser.add_argument('--max_item_num', type=int, default=8, help='Maximum number of items to pad/truncate to')
+    args = parser.parse_args()
 
-    def __len__(self):
-        return int(np.ceil(len(self.y) / self.batch_size))
+    # データのロード
+    with open(args.raw_data_path, 'rb') as f:
+        scene_features = pickle.load(f)
 
-    def __getitem__(self, index):
-        batch_indexes = self.indexes[index * self.batch_size:(index + 1) * self.batch_size]
-        X1_batch = self.X1[batch_indexes]
-        X2_batch = self.X2[batch_indexes]
-        y_batch = self.y[batch_indexes]
-        return (X1_batch, X2_batch), y_batch
+    # データセットの生成
+    X_Q, X_P, Y, Y_cat_Q, Y_cat_P, X_sizes = create_query_positive_groups(
+        scene_features,
+        min_items=args.min_items,
+        max_items=args.max_items,
+        max_item_num=args.max_item_num
+    )
 
-    def on_epoch_end(self):
-        if self.shuffle:
-            np.random.shuffle(self.indexes)
+    # シーンIDを整数に変換
+    unique_scene_ids = np.unique(Y)
+    scene_id_to_int = {sid: idx for idx, sid in enumerate(unique_scene_ids)}
+    Y_int = np.array([scene_id_to_int[sid] for sid in Y], dtype=np.int32)
 
+    # カテゴリIDのエンコーディング
+    # 既にカテゴリIDが整数である場合、必要に応じてインデックスを再マッピング
+    unique_category_ids = np.unique(Y_cat_Q)  # クエリとポジティブで共通のカテゴリIDセット
+    category_id_to_int = {cid: idx for idx, cid in enumerate(unique_category_ids)}
+    Y_cat_Q_encoded = np.array([[category_id_to_int[cid] for cid in sample] for sample in Y_cat_Q], dtype=int)
+    Y_cat_P_encoded = np.array([[category_id_to_int[cid] for cid in sample] for sample in Y_cat_P], dtype=int)
 
-class trainDataGenerator(tf.keras.utils.Sequence):
-    """
-    Shift15mのようなセット単位のデータを返すデータジェネレーター。
-    train_category.pklなどからX,yを読み込み、
-    max_item_num毎にアイテムをグルーピングしてセットを形成。
-    """
+    # データを訓練用とテスト用に分割
+    X_train_Q, X_temp_Q, X_train_P, X_temp_P, y_train, y_temp, y_train_cat_Q, y_temp_cat_Q, y_train_cat_P, y_temp_cat_P, x_sizes_train, x_sizes_temp = train_test_split(
+        X_Q, X_P, Y_int, Y_cat_Q_encoded, Y_cat_P_encoded, X_sizes, test_size=args.test_size + args.validation_size, random_state=42
+    )
+    val_size_relative = args.validation_size / (args.test_size + args.validation_size)
+    X_val_Q, X_test_Q, X_val_P, X_test_P, y_val, y_test, y_val_cat_Q, y_test_cat_Q, y_val_cat_P, y_test_cat_P, x_sizes_val, x_sizes_test = train_test_split(
+        X_temp_Q, X_temp_P, y_temp, y_temp_cat_Q, y_temp_cat_P, x_sizes_temp, test_size=val_size_relative, random_state=42
+    )
 
-    def __init__(self, data_dir='uncompressed_data', batch_size=32, max_item_num=5, shuffle=True, mode='train'):
-        self.data_dir = data_dir
-        self.batch_size = batch_size
-        self.max_item_num = max_item_num
-        self.shuffle = shuffle
-        self.mode = mode
-        self._load_data()
-        self._make_sets()
+    # 出力ディレクトリの作成
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
 
-        self.indexes = np.arange(len(self.set_Y))
-        if self.shuffle:
-            np.random.shuffle(self.indexes)
+    # データの保存
+    with open(os.path.join(args.output_dir, 'train.pkl'), 'wb') as f:
+        pickle.dump((X_train_Q, X_train_P, y_train, y_train_cat_Q, y_train_cat_P, x_sizes_train), f)
+    with open(os.path.join(args.output_dir, 'validation.pkl'), 'wb') as f:
+        pickle.dump((X_val_Q, X_val_P, y_val, y_val_cat_Q, y_val_cat_P, x_sizes_val), f)
+    with open(os.path.join(args.output_dir, 'test.pkl'), 'wb') as f:
+        pickle.dump((X_test_Q, X_test_P, y_test, y_test_cat_Q, y_test_cat_P, x_sizes_test), f)
 
-    def _load_data(self):
-        # ここではtrain_category.pklを利用（カテゴリラベルでグルーピング）
-        if self.mode == 'train':
-            mode_file = 'train_category.pkl'
-        elif self.mode == 'validation':
-            mode_file = 'validation_category.pkl'
-        else:
-            mode_file = 'test_category.pkl'
+    print("Dataset creation completed.")
 
-        data_path = os.path.join(self.data_dir, mode_file)
-        if not os.path.exists(data_path):
-            raise FileNotFoundError(f"{data_path} not found.")
-        with open(data_path,'rb') as f:
-            self.X, self.y = pickle.load(f)  # X: (N,feat_dim=128), y:(N,)
-        self.X = np.array(self.X,dtype=np.float32)
-        self.y = np.array(self.y,dtype=np.float32)
-
-    def _make_sets(self):
-        # N個のアイテムをmax_item_num個ずつセットにまとめる
-        N = len(self.X)
-        # Nがmax_item_numで割り切れない場合カット
-        M = (N // self.max_item_num)*self.max_item_num
-        self.X = self.X[:M]
-        self.y = self.y[:M]
-
-        # reshape (M, feat_dim=128) -> (M/max_item_num, max_item_num, feat_dim=128)
-        feat_dim = self.X.shape[1]
-        self.set_X = self.X.reshape(-1, self.max_item_num, feat_dim)
-        # setラベルはアイテムラベルの先頭を代表ラベルとする
-        self.set_Y = self.y.reshape(-1, self.max_item_num)
-        self.set_Y = self.set_Y[:,0] # 各セットの先頭アイテムラベルをセットラベルとする
-
-        # x_sizeは全てmax_item_num
-        self.x_size = np.full((len(self.set_Y),), self.max_item_num, dtype=np.float32)
-
-    def __len__(self):
-        return int(np.ceil(len(self.set_Y)/self.batch_size))
-
-    def __getitem__(self,index):
-        batch_indexes = self.indexes[index*self.batch_size:(index+1)*self.batch_size]
-        X_batch = self.set_X[batch_indexes]
-        Y_batch = self.set_Y[batch_indexes]
-        x_size_batch = self.x_size[batch_indexes]
-        return (X_batch, x_size_batch), Y_batch
-
-    def on_epoch_end(self):
-        if self.shuffle:
-            np.random.shuffle(self.indexes)
-
-    def data_generation_val(self):
-        # validation用、trainでなくvalidationのとき呼ばれる想定
-        # 今はtrainDataGeneratorでvalidationするために別途インスタンス化するか、
-        # ここでは別メソッドでバリデーション用データを同様に生成
-
-        # validationデータロード
-        val_path = os.path.join(self.data_dir, 'validation_category.pkl')
-        if not os.path.exists(val_path):
-            # validationないならtrainと同じデータ返すなど暫定対応
-            return self.set_X, self.x_size, self.set_Y
-
-        with open(val_path, 'rb') as f:
-            X_val, y_val = pickle.load(f)
-        X_val = np.array(X_val,dtype=np.float32)
-        y_val = np.array(y_val,dtype=np.float32)
-
-        N = len(X_val)
-        M = (N//self.max_item_num)*self.max_item_num
-        X_val = X_val[:M]
-        y_val = y_val[:M]
-        feat_dim = X_val.shape[1]
-        X_val_set = X_val.reshape(-1, self.max_item_num, feat_dim)
-        y_val_set = y_val.reshape(-1, self.max_item_num)[:,0]
-        x_size_val = np.full((len(y_val_set),), self.max_item_num, dtype=np.float32)
-
-        return X_val_set, x_size_val, y_val_set
+if __name__ == '__main__':
+    main()
